@@ -77,6 +77,49 @@ the delta-rs 1.0 upgrade guide, and `polars<1.14` because 1.15 broke `hive_parti
 table, so catalog export works for a table that does not exist yet. Preserve that property: it is
 why export does not need live credentials.
 
+## An empty location is not a failure of the query
+
+Reading a partition that holds no data is ordinary — asking for yesterday before
+yesterday has landed is not a bug — but polars reports it as a low-level failure
+that never mentions the table. It reports it three different ways, and the third
+is the interesting one:
+
+| How the location is empty | polars 1.12 raises |
+| :--- | :--- |
+| the path does not exist | `FileNotFoundError: No such file or directory (os error 2)` |
+| the path exists and lists nothing | `ComputeError: expected at least 1 source` |
+| ... and a `schema=` is declared | `PanicException` — **a pyo3 panic, which is not an `Exception`** |
+
+That last row matters twice over. `except Exception` does not catch a panic, so
+a caller could not handle the case at all; and `ParquetTable(schema=...)`
+documents itself as the way to "succeed even when the S3 path contains no files",
+which on the supported polars range (`>=1.9,<1.14`) it does not do. All three are
+translated into `DatasourceNotAvailable`, which subclasses `FileNotFoundError` so
+that anything already catching that keeps working.
+
+### Why the translation happens at collect(), not up front
+
+`pl.scan_parquet` does no IO — it returns in well under a millisecond on a path
+that does not exist. Checking the location inside `__call__` would therefore add
+a listing to *every* read, including reads that are never collected, to improve
+an error message. That trade is not worth making against S3.
+
+So the scan stays lazy and the error is translated where it actually surfaces.
+`_ParquetScanFrame` overrides `collect()`; the table name and uri ride along as
+**class** attributes, because polars rebuilds a frame through
+`type(self)._from_pyldf` on every operation — which preserves a subclass across
+`.filter()` but silently drops instance attributes. `_scan_frame_class` is
+`lru_cache`d so reading a table in a loop does not mint a class per call.
+
+If you extend this, two rules:
+
+- **Match narrowly.** `_describes_empty_source` keys off the exact messages
+  above. A corrupt parquet file and a denied bucket are real failures and must
+  keep their own errors; a test asserts a truncated file still raises
+  `ComputeError`.
+- **Only `collect()` is translated.** `collect_async`, `fetch` and `profile` are
+  not, so the underlying error still comes through there.
+
 ## Conventions
 
 - Type annotations throughout, and Google-style docstrings with `Args:`/`Returns:` on public

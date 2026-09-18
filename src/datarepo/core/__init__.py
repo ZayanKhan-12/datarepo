@@ -1,6 +1,7 @@
 from datarepo.core.catalog import Catalog, Database, ModuleDatabase, CatalogMetadata
 from datarepo.core.dataframe import NlkDataFrame
 from datarepo.core.tables import (
+    DatasourceNotAvailable,
     DeltaCacheOptions,
     DeltalakeTable,
     Filter,
@@ -18,6 +19,7 @@ from datarepo.core.config import set_default_aws_profile
 
 
 __all__ = [
+    "DatasourceNotAvailable",
     "DeltalakeTable",
     "DeltaCacheOptions",
     "ParquetTable",
