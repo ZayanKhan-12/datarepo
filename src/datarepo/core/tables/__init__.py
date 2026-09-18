@@ -1,4 +1,5 @@
 from datarepo.core.tables.decorator import table
+from datarepo.core.tables.exceptions import DatasourceNotAvailable
 from datarepo.core.tables.deltalake_table import (
     DeltaCacheOptions,
     DeltalakeTable,
@@ -19,6 +20,7 @@ from datarepo.core.tables.util import (
 )
 
 __all__ = [
+    "DatasourceNotAvailable",
     "DeltalakeTable",
     "DeltaCacheOptions",
     "ParquetTable",

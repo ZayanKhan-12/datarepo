@@ -4,9 +4,13 @@ from os import path
 from typing import Any, Optional, Sequence
 
 import boto3
+import functools
+
 import polars as pl
+from polars.exceptions import ComputeError, PanicException
 
 from datarepo.core.dataframe import NlkDataFrame
+from datarepo.core.tables.exceptions import DatasourceNotAvailable
 from datarepo.core.tables.filters import (
     InputFilters,
     NormalizedFilters,
@@ -147,6 +151,70 @@ def _filter_to_expr(filter: Filter) -> pl.Expr:
         )
     else:
         raise ValueError(f"Unsupported operator {filter.operator}")
+
+
+# Polars reports "this location holds no data" three different ways, depending
+# on how it is empty, and none of them names the table.  These are the exact
+# messages seen on the supported range (polars >=1.9, <1.14); anything else is
+# a real failure -- a corrupt file, a denied bucket -- and is left alone.
+_MISSING_PATH = "no such file or directory"
+_NO_SOURCES = "expected at least 1 source"
+# Raised only when an explicit schema is declared over an empty location.  It
+# is a pyo3 panic, so it does not inherit from Exception and ordinary
+# ``except Exception`` never sees it.
+_EMPTY_WITH_SCHEMA_PANIC = "called `option::unwrap()` on a `none` value"
+
+
+def _describes_empty_source(error: BaseException) -> bool:
+    """Whether this failure means the location simply holds no data."""
+    message = str(error).lower()
+    if isinstance(error, PanicException):
+        return _EMPTY_WITH_SCHEMA_PANIC in message
+    if isinstance(error, FileNotFoundError):
+        return _MISSING_PATH in message
+    if isinstance(error, ComputeError):
+        return _NO_SOURCES in message
+    return False
+
+
+class _ParquetScanFrame(pl.LazyFrame):
+    """A LazyFrame that knows which table it came from.
+
+    The scan stays lazy, so nothing here costs a listing: the table is only
+    consulted once polars has already failed, to say what failed and where.
+
+    Polars rebuilds a frame through ``type(self)._from_pyldf`` on every
+    operation, which keeps the subclass across ``.filter()`` and friends but
+    drops instance attributes.  The table name and uri are therefore class
+    attributes on a subclass generated per scan; see ``_scan_frame_class``.
+    """
+
+    _table_name = "<unknown>"
+    _uri = "<unknown>"
+
+    def collect(self, *args: Any, **kwargs: Any) -> pl.DataFrame:
+        try:
+            return super().collect(*args, **kwargs)
+        except (FileNotFoundError, ComputeError, PanicException) as error:
+            if _describes_empty_source(error):
+                raise DatasourceNotAvailable(
+                    self._table_name, self._uri, str(error).splitlines()[0]
+                ) from error
+            raise
+
+
+@functools.lru_cache(maxsize=256)
+def _scan_frame_class(table_name: str, uri: str) -> type[_ParquetScanFrame]:
+    """The frame subclass carrying this scan's identity.
+
+    Cached so that reading the same table repeatedly does not build a new
+    class every call.
+    """
+    return type(
+        "ParquetScanFrame",
+        (_ParquetScanFrame,),
+        {"_table_name": table_name, "_uri": uri},
+    )
 
 
 class ParquetTable(TableProtocol):
@@ -321,7 +389,9 @@ class ParquetTable(TableProtocol):
         if columns:
             df = df.select(columns)
 
-        return df
+        # Re-badge the frame so that a failure at collect() can name the table
+        # and the location it resolved to.  This adds no work to the scan.
+        return _scan_frame_class(self.name, uri)._from_pyldf(df._ldf)
 
     def build_file_fragment(self, filters: list[Filter]) -> str:
         """
